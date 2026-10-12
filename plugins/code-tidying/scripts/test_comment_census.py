@@ -247,7 +247,7 @@ class SccArgv(unittest.TestCase):
         self.assertIn("--", argv)
         paths = argv[argv.index("--") + 1 :]
         self.assertTrue(paths, "no files reached scc")
-        self.assertTrue(all(a.startswith(("./", ".\\\\", "/")) for a in paths), paths)
+        self.assertTrue(all(a.startswith(("./", ".\\", "/")) for a in paths), paths)
         self.assertIn(os.path.join(".", "-o=evil.py"), paths)
         self.assertNotIn("-o=evil.py", argv[: argv.index("--")])
         self.assertFalse((tmp / "evil.py").exists())
