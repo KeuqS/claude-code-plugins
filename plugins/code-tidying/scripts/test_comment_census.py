@@ -216,9 +216,18 @@ class SccArgv(unittest.TestCase):
         (tmp / "-o=evil.py").write_text(MOD_PY)
         shim_dir = tmp / "bin"
         shim_dir.mkdir()
-        shim = shim_dir / "scc"
-        shim.write_text(FAKE_SCC)
-        shim.chmod(0o755)
+        if os.name == "nt":
+            # Windows cannot execute a POSIX shebang directly. Keep the command
+            # name as "scc" while using a .cmd shim to launch the same Python
+            # recorder through the current interpreter.
+            fake_scc = shim_dir / "scc.py"
+            fake_scc.write_text(FAKE_SCC)
+            shim = shim_dir / "scc.cmd"
+            shim.write_text(f'@"{sys.executable}" "%~dp0scc.py" %*\\n')
+        else:
+            shim = shim_dir / "scc"
+            shim.write_text(FAKE_SCC)
+            shim.chmod(0o755)
         argv_file = tmp / "argv.json"
         env = {
             **os.environ,
@@ -238,8 +247,8 @@ class SccArgv(unittest.TestCase):
         self.assertIn("--", argv)
         paths = argv[argv.index("--") + 1 :]
         self.assertTrue(paths, "no files reached scc")
-        self.assertTrue(all(a.startswith(("./", "/")) for a in paths), paths)
-        self.assertIn("./-o=evil.py", paths)
+        self.assertTrue(all(a.startswith(("./", ".\\\\", "/")) for a in paths), paths)
+        self.assertIn(os.path.join(".", "-o=evil.py"), paths)
         self.assertNotIn("-o=evil.py", argv[: argv.index("--")])
         self.assertFalse((tmp / "evil.py").exists())
 
