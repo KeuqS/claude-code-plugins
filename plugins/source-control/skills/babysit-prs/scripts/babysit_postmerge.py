@@ -8,8 +8,10 @@ read-back that the merged head equals the SHA the wrapper pinned. Nothing is
 stored on the host, so every host reaches the same verdict.
 
 An auto-merge is any merge whose `AddedToMergeQueueEvent` `actor` or
-`enqueuer` is null or not a human; a merge on the branch with no queue event
-is reported as the warning `unqueued-merge`. It is verified when a green
+`enqueuer` is null or not a human, or that bypassed the queue with a null or
+non-human `mergedBy` (`babysit_merge_policy.derive_auto_merge`, which
+`in_flight` shares); a queue-bypassing merge by a human is reported as the
+warning `unqueued-merge`. It is verified when a green
 dispatch run by the identity on a SHA containing the merge, a green canary
 run on such a SHA, and a matching read-back all exist, and no red full run or
 canary run counted against it first. Only an enqueue by the identity has a
@@ -25,15 +27,22 @@ also dispatches one full run on the branch tip whenever an unverified
 auto-merge has no identity dispatch run covering it, so a merge nobody
 dispatched for (a sync App's own enqueue) cannot hold the lane forever.
 
-Exit codes: 0 no failure, 1 a failure, 2 usage or a refused identity (not a
-dedicated App login, or `--remediate` under another acting login), 3
-unreadable, 4 a write failed.
+The pinned SHA is read from the agent identity's `<!-- babysit-merge-pin
+sha=<S> -->` comment, which `babysit_merge.py --unattended` posts immediately
+before it enqueues. Without `--since` the floor is the merge gate's: the later
+of the enabling config commit and the newest human close of a demotion record.
+
+Exit codes: 0 no failure and every auto-merge verified, 1 a failure, 2 usage
+or a refused identity (not a dedicated App login, or `--remediate` under
+another acting login), 3 unreadable, 4 a write failed, 5 no failure but an
+auto-merge not yet verified. Only 0 lets a merge proceed.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from collections.abc import Callable, Collection, Iterable
 from dataclasses import dataclass, field
@@ -60,7 +69,7 @@ TRACKER_CONFIG = ".work-item-tracker.json"
 # the same prefix, so either filer's note is a sighting to the other.
 FAILURE_NOTE = "The post-merge check found this failure again: "
 MERGED_PAGE_SIZE = 100
-MERGED_PAGE_LIMIT = 10
+MERGED_PAGE_LIMIT = 30
 
 SIGNAL_SCHEDULE = "schedule"
 SIGNAL_DISPATCH = "dispatch"
@@ -68,6 +77,8 @@ SIGNAL_CANARY = "canary"
 SIGNAL_READ_BACK = "read-back"
 
 GREEN, FLAKE, RED, RERUN, PENDING = "green", "flake", "red", "rerun", "pending"
+
+EXIT_FAILURE, EXIT_UNREADABLE, EXIT_WRITE_FAILED, EXIT_UNVERIFIED = 1, 3, 4, 5
 
 IsHuman = Callable[[Any], bool]
 
@@ -80,21 +91,10 @@ class PostMergeWriteError(RuntimeError):
     """A remediation write failed."""
 
 
-@dataclass(frozen=True)
-class AutoMerge:
-    """A merged pull request whose merge-queue enqueue was not a human's.
-
-    Carries the fields `babysit_merge_policy.in_flight` passes its `verified`
-    callable, so `PostMergeVerdict.is_verified` can serve as that callable."""
-
-    number: int
-    merge_commit: str | None
-    head_ref_oid: str | None
-    merged_at: str | None
-    url: str | None = None
-    # The agent identity enqueued it, so the wrapper pinned its head; any other
-    # enqueue has no pin and verifies on the dispatch and canary runs alone.
-    by_identity: bool = False
+# One type and one derivation with `babysit_merge_policy.in_flight`, so both
+# judge the same merges and `PostMergeVerdict.is_verified` serves as its
+# `verified` callable.
+AutoMerge = policy.AutoMerge
 
 
 @dataclass(frozen=True)
@@ -216,14 +216,7 @@ def _login_key(login: Any) -> str:
     return str(login or "").strip().casefold()
 
 
-def _actor_key(actor: Any) -> str:
-    """A GraphQL actor in REST spelling: a `Bot` login gains the `[bot]` suffix
-    GraphQL omits; any other type keeps its login as is."""
-    item = json_object(actor)
-    login = _login_key(item.get("login"))
-    if login and item.get("__typename") == "Bot" and not login.endswith("[bot]"):
-        login += "[bot]"
-    return login
+_actor_key = policy.actor_key
 
 
 def _time(value: Any) -> datetime:
@@ -292,6 +285,7 @@ MERGED_QUERY = (
     "repository(owner:$o,name:$r){pullRequests(baseRefName:$b,states:MERGED,"
     f"first:{MERGED_PAGE_SIZE},after:$c,orderBy:{{field:UPDATED_AT,direction:DESC}}){{"
     "pageInfo{hasNextPage endCursor} nodes{number url mergedAt updatedAt headRefOid "
+    "mergedBy{__typename login} "
     "mergeCommit{oid} timelineItems(itemTypes:[ADDED_TO_MERGE_QUEUE_EVENT],last:1){nodes{"
     "... on AddedToMergeQueueEvent{createdAt actor{__typename login} enqueuer{__typename login}}}}}}}}"
 )
@@ -568,7 +562,20 @@ def _judge(
     ]
 
     if merge.by_identity and pinned is None:
-        pending.append("read-back-unrecorded")
+        # A missing or edited pin is pending until the dispatch deadline, then
+        # a failure, so a demotion record is filed and a human close restarts
+        # the floor instead of the lane holding forever.
+        if now > merged_at + DISPATCH_DEADLINE:
+            failures.append(
+                Failure(
+                    SIGNAL_READ_BACK,
+                    merge,
+                    None,
+                    "no unedited pin comment by the agent identity",
+                )
+            )
+        else:
+            pending.append("read-back-unrecorded")
     elif merge.by_identity and pinned != merge.head_ref_oid:
         failures.append(
             Failure(
@@ -635,31 +642,6 @@ def _judge(
     return MergeState(merge, verified, tuple(pending), dispatch_covered=bool(own))
 
 
-def _auto_merge(
-    pr: dict[str, Any], is_human: IsHuman, identity: str
-) -> AutoMerge | None | str:
-    """The pull request as an AutoMerge, None for a human enqueue, or the
-    warning for a merge with no queue event."""
-    events = json_array(json_object(pr.get("timelineItems")).get("nodes"))
-    if not events:
-        return f"unqueued-merge:#{pr.get('number')}"
-    event = json_object(events[-1])
-    actor, enqueuer = event.get("actor"), event.get("enqueuer")
-    if is_human(actor) and is_human(enqueuer):
-        return None
-    number = pr.get("number")
-    if not isinstance(number, int) or isinstance(number, bool):
-        raise PostMergeReadError(f"merged pull request: no number {number!r}")
-    return AutoMerge(
-        number=number,
-        merge_commit=json_object(pr.get("mergeCommit")).get("oid"),
-        head_ref_oid=pr.get("headRefOid"),
-        merged_at=pr.get("mergedAt"),
-        url=pr.get("url"),
-        by_identity=identity in (_actor_key(actor), _actor_key(enqueuer)),
-    )
-
-
 def check(
     repo: str,
     *,
@@ -691,7 +673,7 @@ def check(
         warnings: list[str] = []
         identity = _login_key(agent_identity)
         for pr in _merged_since(owner, name, branch, merged_since):
-            derived = _auto_merge(pr, is_human, identity)
+            derived = policy.derive_auto_merge(pr, is_human, identity)
             if isinstance(derived, str):
                 warnings.append(derived)
             elif derived is not None:
@@ -726,13 +708,13 @@ def check(
                 ctx,
                 full_runs=full_runs,
                 canary_runs=canary_runs,
-                pinned=pinned_sha(merge) if pinned_sha else None,
+                pinned=pinned_sha(merge) if pinned_sha and merge.by_identity else None,
                 now=now,
                 tally=tally,
             )
             for merge in merges
         )
-    except PostMergeReadError as exc:
+    except (PostMergeReadError, policy.PolicyReadError) as exc:
         return PostMergeVerdict(False, f"unreadable: {exc}")
     return PostMergeVerdict(
         True,
@@ -749,9 +731,11 @@ def check(
 
 
 def dispatch_full_run(repo: str, *, ref: str) -> None:
-    """Dispatch the full `pr-require-checks` run on `ref`; called only by
-    `--remediate` when the verdict needs a dispatch. Without `--remediate` under
-    the identity nobody dispatches, so each auto-merge fails at the deadline."""
+    """Dispatch the full `pr-require-checks` run on `ref`; called by
+    `--remediate` when the verdict needs a dispatch, and by the unattended
+    merge gate (`babysit_merge.py`) once a landed merge reads back at its pin.
+    When neither dispatches under the identity, each auto-merge fails at the
+    deadline."""
     owner, name = _split_repo(repo)
     _write(
         [
@@ -830,6 +814,110 @@ def _identity_entries(
             pr = json_object(entry.get("pullRequest"))
             found.append((str(pr.get("id")), pr.get("number")))
     return found, unknown
+
+
+def identity_queue(repo: str, branch: str, identity: str) -> tuple[list[int], int]:
+    """The pull request numbers of the agent identity's merge-queue entries on
+    `branch`, and how many entries have an unknown enqueuer."""
+    owner, name = _split_repo(repo)
+    entries, unknown = _identity_entries(owner, name, branch, identity)
+    return [number for _, number in entries], unknown
+
+
+def dequeue_identity_entries(
+    repo: str,
+    branch: str,
+    identity: str,
+    *,
+    numbers: Collection[int] | None = None,
+    dequeued: list[int] | None = None,
+) -> int:
+    """Dequeue the agent identity's merge-queue entries on `branch`, only those
+    for `numbers` when given, appending each pull request number to
+    `dequeued` as it goes. Returns how many entries have an unknown enqueuer:
+    those cannot be judged the identity's and are left for the caller to
+    report. Never touches another actor's entry. Raises `PostMergeReadError`
+    or `PostMergeWriteError`."""
+    owner, name = _split_repo(repo)
+    entries, unknown = _identity_entries(owner, name, branch, identity)
+    for pr_id, number in entries:
+        if numbers is not None and number not in numbers:
+            continue
+        _graphql(DEQUEUE_MUTATION, f"dequeue #{number}", PostMergeWriteError, id=pr_id)
+        if dequeued is not None:
+            dequeued.append(number)
+    return unknown
+
+
+# The pinned-head record: an identity-authored comment the wrapper posts on the
+# pull request immediately before it enqueues, so the read-back has a source no
+# host stores.
+PIN_RE = re.compile(r"^<!-- babysit-merge-pin sha=([0-9a-f]{40}) -->$")
+PIN_QUERY = (
+    "query PostMergePin($o:String!,$r:String!,$n:Int!,$c:String){repository(owner:$o,name:$r){"
+    "pullRequest(number:$n){comments(first:100,after:$c){"
+    "pageInfo{hasNextPage endCursor} nodes{"
+    "author{__typename login} body lastEditedAt}}}}}"
+)
+# Comment pages the pin read walks: 3000 comments. A longer thread reads as
+# no pin, which fails the read-back once the dispatch deadline passes.
+PIN_PAGE_LIMIT = 30
+
+
+def pin_comment(sha: str) -> str:
+    return (
+        f"<!-- babysit-merge-pin sha={sha} -->\n"
+        f"The unattended merge path enqueued this pull request at head `{sha}`."
+    )
+
+
+def read_pin(repo: str, number: int, identity: str) -> str | None:
+    """The head SHA the agent identity pinned for `number`: its newest pin
+    comment, read through every comment page, or None when there is none,
+    the thread runs past `PIN_PAGE_LIMIT` pages, or that comment was edited
+    (anyone with write access can edit it)."""
+    owner, name = _split_repo(repo)
+    pins: list[dict[str, Any]] = []
+    cursor: str | None = None
+    for _ in range(PIN_PAGE_LIMIT):
+        args = ["api", "graphql", "-f", f"query={PIN_QUERY}", "-f", f"o={owner}"]
+        args += ["-f", f"r={name}", "-F", f"n={number}"]
+        if cursor:
+            args += ["-f", f"c={cursor}"]
+        payload = _read(args, f"#{number} pin")
+        if not is_json_object(payload) or payload.get("errors"):
+            raise PostMergeReadError(f"#{number} pin: the response carried no data")
+        pull = json_object(
+            json_object(json_object(payload.get("data")).get("repository")).get(
+                "pullRequest"
+            )
+        )
+        page = json_object(pull.get("comments"))
+        nodes, info = page.get("nodes"), json_object(page.get("pageInfo"))
+        if not is_json_array(nodes) or not isinstance(info.get("hasNextPage"), bool):
+            raise PostMergeReadError(f"#{number} pin: no comment page")
+        pins += [
+            node
+            for node in map(json_object, nodes)
+            if _actor_key(node.get("author")) == _login_key(identity)
+            and PIN_RE.match(_first_line(node.get("body")))
+        ]
+        cursor = info.get("endCursor")
+        if not info["hasNextPage"]:
+            break
+        if not isinstance(cursor, str) or not cursor:
+            raise PostMergeReadError(f"#{number} pin: a next page with no cursor")
+    else:
+        return None
+    if not pins or pins[-1].get("lastEditedAt"):
+        return None
+    match = PIN_RE.match(_first_line(pins[-1].get("body")))
+    return match[1] if match else None
+
+
+def pin_reader(repo: str, identity: str) -> Callable[[AutoMerge], str | None]:
+    """`check()`'s `pinned_sha` callable: the identity's pin on each merge."""
+    return lambda merge: read_pin(repo, merge.number, identity)
 
 
 def _demotion_issues(
@@ -931,12 +1019,9 @@ def remediate(
         queue_branch = branch or verdict.branch
         if not queue_branch:
             raise PostMergeReadError("no branch to read the merge queue of")
-        entries, unknown = _identity_entries(owner, name, queue_branch, agent_identity)
-        for pr_id, number in entries:
-            _graphql(
-                DEQUEUE_MUTATION, f"dequeue #{number}", PostMergeWriteError, id=pr_id
-            )
-            report["dequeued"].append(number)
+        unknown = dequeue_identity_entries(
+            repo, queue_branch, agent_identity, dequeued=report["dequeued"]
+        )
         if unknown:
             raise PostMergeReadError(
                 f"merge queue: {unknown} entries have an unknown enqueuer"
@@ -1092,6 +1177,28 @@ def _default_is_human(
     )
 
 
+def verdict_exit(verdict: PostMergeVerdict) -> int:
+    """3 unreadable, 1 a failure, 5 an auto-merge not yet verified, else 0:
+    only 0 lets a merge proceed, so code, not prose, holds the lane."""
+    if not verdict.readable:
+        return EXIT_UNREADABLE
+    if verdict.failures:
+        return EXIT_FAILURE
+    if any(not state.verified for state in verdict.merges):
+        return EXIT_UNVERIFIED
+    return 0
+
+
+def default_floor(repo: str, identity: str, self_logins: Collection[str]) -> datetime:
+    """The merge gate's floor at the default branch head
+    (`babysit_merge_policy.merged_since_floor`). Raises `PolicyReadError`."""
+    _, head = policy._default_branch_head(repo)
+    demotion = policy.read_demotion(
+        repo, agent_identity=identity, self_logins=self_logins
+    )
+    return policy.merged_since_floor(repo, head, demotion)
+
+
 def _since(value: str) -> datetime:
     parsed = datetime.fromisoformat(value)
     if parsed.utcoffset() is None:
@@ -1110,7 +1217,13 @@ def main(argv: list[str] | None = None) -> int:
         "--agent-identity", required=True, help="the merge.agent-identity login"
     )
     parser.add_argument(
-        "--since", required=True, type=_since, help="ISO 8601 floor with an offset"
+        "--since",
+        type=_since,
+        help=(
+            "ISO 8601 floor with an offset (default: the floor the merge gate "
+            "uses, the later of the enabling config commit and the newest human "
+            "close of a demotion record)"
+        ),
     )
     parser.add_argument(
         "--branch",
@@ -1149,21 +1262,32 @@ def main(argv: list[str] | None = None) -> int:
         sys.stdout.write("\n")
         return 2
 
+    is_human = _default_is_human(args.repo, args.agent_identity, args.self_login)
+    since = args.since
+    if since is None:
+        try:
+            since = default_floor(args.repo, args.agent_identity, args.self_login)
+        except policy.PolicyReadError as exc:
+            json.dump({"ok": False, "error": f"floor unreadable: {exc}"}, sys.stdout)
+            sys.stdout.write("\n")
+            return EXIT_UNREADABLE
     verdict = check(
         args.repo,
         agent_identity=args.agent_identity,
-        is_human=_default_is_human(args.repo, args.agent_identity, args.self_login),
-        merged_since=args.since,
+        is_human=is_human,
+        merged_since=since,
         branch=args.branch,
+        pinned_sha=pin_reader(args.repo, args.agent_identity),
     )
     report = verdict.report()
-    code = 3 if not verdict.readable else 1 if verdict.failures else 0
+    report["since"] = since.isoformat()
+    code = verdict_exit(verdict)
     branch = verdict.branch
     if verdict.readable and not branch:
         # A readable verdict always names its branch; refuse before any write
         # rather than dispatch or dequeue on an unknown ref.
         report["reason"] = "branch-unknown"
-        code = 3
+        code = EXIT_UNREADABLE
     elif args.remediate and verdict.readable and branch:
         errors: list[str] = []
         try:
@@ -1182,7 +1306,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         report["remediation"]["errors"] = errors + report["remediation"]["errors"]
         if report["remediation"]["errors"]:
-            code = 4
+            code = EXIT_WRITE_FAILED
     json.dump(report, sys.stdout, indent=2)
     sys.stdout.write("\n")
     return code

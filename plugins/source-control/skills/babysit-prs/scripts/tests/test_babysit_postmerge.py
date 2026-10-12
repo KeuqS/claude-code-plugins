@@ -158,6 +158,10 @@ class FakeGh:
         # A login's repository permission, or the HTTP status its read fails with.
         self.permissions: dict[str, str | int] = {"maintainer": "write"}
         self.viewer = IDENTITY
+        # The pull request's last comments, as the pin read returns them.
+        self.pin_comments: list[dict[str, Any]] = []
+        # Comment pages served in order, one per pin read, when set.
+        self.pin_pages: list[dict[str, Any]] = []
 
     def add_runs(self, workflow: str, event: str, *runs: dict[str, Any]) -> None:
         self.runs.setdefault((workflow, event), []).extend(runs)
@@ -247,6 +251,19 @@ class FakeGh:
     def _graphql(self, joined: str) -> subprocess.CompletedProcess[str]:
         if "PolicyViewer" in joined:
             return completed({"data": {"viewer": {"login": self.viewer}}})
+        if "PostMergePin" in joined and self.pin_pages:
+            comments = self.pin_pages.pop(0)
+            return completed(
+                {"data": {"repository": {"pullRequest": {"comments": comments}}}}
+            )
+        if "PostMergePin" in joined:
+            comments = {
+                "pageInfo": {"hasNextPage": False, "endCursor": None},
+                "nodes": self.pin_comments,
+            }
+            return completed(
+                {"data": {"repository": {"pullRequest": {"comments": comments}}}}
+            )
         if "dequeuePullRequest" in joined:
             return completed(
                 {"data": {"dequeuePullRequest": {"clientMutationId": None}}}
@@ -336,12 +353,51 @@ class AutoMergeDerivation(CheckCase):
         self.assertEqual(self.numbers(verdict), [7001])
         self.assertFalse(verdict.is_verified(verdict.merges[0].merge))
 
-    def test_merge_without_a_queue_event_is_an_unqueued_merge_warning(self) -> None:
-        self.gh.merged = [merged_pr(timelineItems={"nodes": []})]
+    def test_a_human_merge_without_a_queue_event_is_an_unqueued_merge_warning(
+        self,
+    ) -> None:
+        self.gh.merged = [merged_pr(timelineItems={"nodes": []}, mergedBy=HUMAN)]
         verdict = self.check()
         self.assertEqual(verdict.warnings, ("unqueued-merge:#7001",))
         self.assertEqual(self.numbers(verdict), [])
         self.assertTrue(verdict.ok)
+
+    def test_a_queue_bypassing_merge_by_a_non_human_is_an_auto_merge(self) -> None:
+        # Design "Enqueuer": an unqueued merge is judged on mergedBy.
+        for merged_by in (None, APP_ACTOR, {"__typename": "Bot", "login": "x"}):
+            with self.subTest(merged_by=merged_by):
+                self.gh.merged = [
+                    merged_pr(timelineItems={"nodes": []}, mergedBy=merged_by)
+                ]
+                verdict = self.check()
+                self.assertEqual(self.numbers(verdict), [7001])
+                self.assertEqual(verdict.warnings, ())
+                self.assertFalse(verdict.merges[0].merge.queued)
+
+    def test_an_identity_merge_bypassing_the_queue_needs_its_pin(self) -> None:
+        self.all_green()
+        self.gh.merged = [merged_pr(timelineItems={"nodes": []}, mergedBy=APP_ACTOR)]
+        verdict = self.check(pinned=None)
+        self.assertTrue(verdict.merges[0].merge.by_identity)
+        self.assertEqual(verdict.merges[0].pending, ("read-back-unrecorded",))
+
+    def test_in_flight_and_the_check_derive_the_same_auto_merges(self) -> None:
+        # One derivation: the identity's REST spelling and a slug-named User.
+        slug_user = {"__typename": "User", "login": "agent-lanes"}
+        cases = [
+            merged_pr(number=1, timelineItems=enqueued_by(HUMAN, HUMAN)),
+            merged_pr(number=2, timelineItems=enqueued_by(APP_ACTOR, None)),
+            merged_pr(number=3, timelineItems={"nodes": []}, mergedBy=HUMAN),
+            merged_pr(number=4, timelineItems={"nodes": []}, mergedBy=None),
+            merged_pr(number=5, timelineItems=enqueued_by(slug_user, slug_user)),
+        ]
+        derived = [pm.policy.derive_auto_merge(pr, human, IDENTITY) for pr in cases]
+        self.assertIsNone(derived[0])
+        self.assertEqual(derived[2], "unqueued-merge:#3")
+        self.assertEqual(
+            [(d.number, d.by_identity) for d in derived if isinstance(d, pm.AutoMerge)],
+            [(2, True), (4, False), (5, False)],
+        )
 
     def test_merge_before_the_floor_is_not_read(self) -> None:
         self.gh.merged = [
@@ -1275,6 +1331,196 @@ class IdentityRefusal(CheckCase):
         self.gh.merged = [merged_pr(timelineItems=enqueued_by(HUMAN, HUMAN))]
         code, _ = self.main(IDENTITY)
         self.assertEqual(code, 0)
+
+
+def pin(sha: str, *, author: Any = APP_ACTOR, edited: str | None = None) -> Any:
+    return {"author": author, "body": pm.pin_comment(sha), "lastEditedAt": edited}
+
+
+class PinnedHead(CheckCase):
+    """The read-back source (carried from #7327): the identity's pin comment,
+    posted before the enqueue."""
+
+    def test_the_identitys_newest_unedited_pin_is_the_pinned_head(self) -> None:
+        self.gh.pin_comments = [pin(OTHER_SHA), pin(HEAD_SHA)]
+        self.assertEqual(pm.read_pin(REPO, 7001, IDENTITY), HEAD_SHA)
+
+    def test_a_pin_by_anyone_else_is_ignored(self) -> None:
+        for author in (HUMAN, {"__typename": "User", "login": "agent-lanes"}):
+            with self.subTest(author=author):
+                self.gh.pin_comments = [pin(HEAD_SHA, author=author)]
+                self.assertIsNone(pm.read_pin(REPO, 7001, IDENTITY))
+
+    def test_an_edited_newest_pin_is_no_pin(self) -> None:
+        self.gh.pin_comments = [
+            pin(OTHER_SHA),
+            pin(HEAD_SHA, edited="2026-10-12T10:30:00Z"),
+        ]
+        self.assertIsNone(pm.read_pin(REPO, 7001, IDENTITY))
+
+    def test_the_read_back_uses_the_pin_comment(self) -> None:
+        self.all_green()
+        self.gh.merged = [identity_merge()]
+        for pins, expected in (
+            ([pin(HEAD_SHA)], (True, ())),
+            ([pin(OTHER_SHA)], (False, None)),
+            ([], (False, ("read-back-unrecorded",))),
+        ):
+            with self.subTest(pins=len(pins)):
+                self.gh.pin_comments = pins
+                verdict = pm.check(
+                    REPO,
+                    agent_identity=IDENTITY,
+                    is_human=human,
+                    merged_since=SINCE,
+                    now=datetime(2026, 10, 12, 11, 0, tzinfo=UTC),
+                    pinned_sha=pm.pin_reader(REPO, IDENTITY),
+                )
+                state = verdict.merges[0]
+                self.assertEqual(state.verified, expected[0])
+                if expected[1] is not None:
+                    self.assertEqual(state.pending, expected[1])
+                else:
+                    self.assertEqual(
+                        [f.signal for f in verdict.failures], [pm.SIGNAL_READ_BACK]
+                    )
+
+    def test_a_pin_behind_100_later_comments_is_found(self) -> None:
+        chatter = [{"author": HUMAN, "body": "lgtm", "lastEditedAt": None}] * 100
+        self.gh.pin_pages = [
+            {
+                "pageInfo": {"hasNextPage": True, "endCursor": "c1"},
+                "nodes": [pin(HEAD_SHA)],
+            },
+            {"pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": chatter},
+        ]
+        self.assertEqual(pm.read_pin(REPO, 7001, IDENTITY), HEAD_SHA)
+        reads = [c for c in self.gh.calls if any("PostMergePin" in a for a in c)]
+        self.assertEqual(len(reads), 2)
+        self.assertIn("c=c1", reads[1])
+
+    def test_an_unrecorded_pin_past_the_deadline_is_a_failure(self) -> None:
+        # Gate finding 3: a missing or edited pin must not hold the lane forever
+        # with no record; past the dispatch deadline it files one.
+        self.all_green()
+        self.gh.merged = [identity_merge()]
+        for now, failed in (
+            (datetime(2026, 10, 12, 11, 0, tzinfo=UTC), False),
+            (datetime(2026, 10, 12, 16, 1, tzinfo=UTC), True),
+        ):
+            with self.subTest(now=now):
+                verdict = self.check(now=now, pinned=None)
+                signals = [f.signal for f in verdict.failures]
+                self.assertEqual(signals, [pm.SIGNAL_READ_BACK] if failed else [])
+                self.assertFalse(verdict.merges[0].verified)
+
+    def test_a_merge_the_identity_did_not_land_reads_no_pin(self) -> None:
+        self.all_green()
+        pins: list[Any] = []
+        verdict = pm.check(
+            REPO,
+            agent_identity=IDENTITY,
+            is_human=human,
+            merged_since=SINCE,
+            now=datetime(2026, 10, 12, 11, 0, tzinfo=UTC),
+            pinned_sha=lambda merge: pins.append(merge) or None,
+        )
+        self.assertEqual(pins, [])
+        self.assertTrue(verdict.merges[0].verified)
+
+
+class ExitCodes(CheckCase):
+    """Exit 5 holds the merge while any auto-merge is unverified (carried from
+    #7327: code, not docs, gates the merge)."""
+
+    def run_cli(self) -> int:
+        out = io.StringIO()
+        with (
+            contextlib.redirect_stdout(out),
+            mock.patch.object(pm, "_default_is_human", return_value=human),
+        ):
+            return pm.main(
+                [
+                    "--repo",
+                    REPO,
+                    "--agent-identity",
+                    IDENTITY,
+                    "--since",
+                    SINCE.isoformat(),
+                ]
+            )
+
+    def test_an_unverified_auto_merge_exits_5(self) -> None:
+        # The dispatch run is green; the canary has not run yet.
+        self.gh.add_runs("pr-require-checks.yml", "workflow_dispatch", dispatch_run(11))
+        self.assertEqual(self.run_cli(), 5)
+
+    def test_every_auto_merge_verified_exits_0(self) -> None:
+        self.all_green()
+        self.assertEqual(self.run_cli(), 0)
+
+    def test_no_auto_merge_exits_0(self) -> None:
+        self.gh.merged = [merged_pr(timelineItems=enqueued_by(HUMAN, HUMAN))]
+        self.assertEqual(self.run_cli(), 0)
+
+    def test_a_failure_exits_1_ahead_of_unverified(self) -> None:
+        self.gh.add_runs("pr-require-checks.yml", "workflow_dispatch", dispatch_run(11))
+        self.gh.add_runs(
+            "post-merge-detect-silent-revert.yml", "push", canary_run(21, "failure")
+        )
+        self.assertEqual(self.run_cli(), 1)
+
+    def test_without_since_the_gates_floor_is_used(self) -> None:
+        floor = datetime(2026, 10, 12, 9, 0, tzinfo=UTC)
+        out = io.StringIO()
+        with (
+            contextlib.redirect_stdout(out),
+            mock.patch.object(pm, "_default_is_human", return_value=human),
+            mock.patch.object(pm, "default_floor", return_value=floor) as computed,
+            mock.patch.object(pm, "check", wraps=pm.check) as checked,
+        ):
+            pm.main(["--repo", REPO, "--agent-identity", IDENTITY])
+        computed.assert_called_once_with(REPO, IDENTITY, [])
+        self.assertEqual(checked.call_args.kwargs["merged_since"], floor)
+        self.assertEqual(json.loads(out.getvalue())["since"], floor.isoformat())
+
+    def test_an_unreadable_floor_exits_3(self) -> None:
+        out = io.StringIO()
+        with (
+            contextlib.redirect_stdout(out),
+            mock.patch.object(
+                pm, "default_floor", side_effect=pm.policy.PolicyReadError("x")
+            ),
+        ):
+            self.assertEqual(pm.main(["--repo", REPO, "--agent-identity", IDENTITY]), 3)
+
+
+class SharedHumanTest(unittest.TestCase):
+    def test_the_cli_judges_actors_with_the_shared_human_test(self) -> None:
+        # F5: the post-merge check and the merge gate share one "Human".
+        with mock.patch.object(pm.policy, "is_human", return_value=True) as shared:
+            judged = pm._default_is_human(REPO, IDENTITY, ["lane[bot]"])(HUMAN)
+        self.assertTrue(judged)
+        self.assertEqual(shared.call_args.args, (HUMAN,))
+        self.assertEqual(shared.call_args.kwargs["agent_identity"], IDENTITY)
+        self.assertEqual(shared.call_args.kwargs["self_logins"], ["lane[bot]"])
+
+
+class DequeueIdentityEntries(CheckCase):
+    def test_only_the_named_identity_entries_are_dequeued(self) -> None:
+        self.gh.queue = [
+            {"enqueuer": APP_ACTOR, "pullRequest": {"id": "PR_a", "number": 1}},
+            {"enqueuer": APP_ACTOR, "pullRequest": {"id": "PR_b", "number": 2}},
+            {"enqueuer": HUMAN, "pullRequest": {"id": "PR_c", "number": 3}},
+        ]
+        done: list[int] = []
+        unknown = pm.dequeue_identity_entries(
+            REPO, "main", IDENTITY, numbers={2, 3}, dequeued=done
+        )
+        self.assertEqual((done, unknown), ([2], 0))
+        mutations = [c for c in self.gh.calls if any("dequeue" in a for a in c)]
+        self.assertEqual(len(mutations), 1)
+        self.assertIn("id=PR_b", mutations[0])
 
 
 if __name__ == "__main__":
