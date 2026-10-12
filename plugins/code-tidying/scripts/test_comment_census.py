@@ -223,7 +223,7 @@ class SccArgv(unittest.TestCase):
             fake_scc = shim_dir / "scc.py"
             fake_scc.write_text(FAKE_SCC)
             shim = shim_dir / "scc.cmd"
-            shim.write_text(f'@"{sys.executable}" "%~dp0scc.py" %*\\n')
+            shim.write_text(f'@"{sys.executable}" "%~dp0scc.py" %*\n')
         else:
             shim = shim_dir / "scc"
             shim.write_text(FAKE_SCC)
